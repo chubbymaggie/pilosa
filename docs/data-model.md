@@ -10,7 +10,6 @@ nav = [
     "Time Quantum",
     "Attribute",
     "Shard",
-    "View",
 ]
 +++
 
@@ -26,7 +25,7 @@ Pilosa lays out data first in rows, so queries which get all the set bits in one
 
 Please note that Pilosa is most performant when row and column IDs are sequential starting from 0. You can deviate from this to some degree, but setting a bit with column ID 2<sup>63</sup> on a single-node cluster, for example, will not work well due to memory limitations.
 
-![basic data model diagram](/img/docs/data-model.svg)
+![basic data model diagram](/img/docs/data-model.png)
 *Basic data model diagram*
 
 ### Index
@@ -89,14 +88,14 @@ This is one major component of Pilosa's ability to combine relationships from mu
 
 Ranked Fields maintain a sorted cache of column counts by Row ID (yielding the top rows by columns with a bit set in each). This cache facilitates the TopN query. The cache size defaults to 50,000 and can be set at Field creation.
 
-![ranked field diagram](/img/docs/field-ranked.svg)
+![ranked field diagram](/img/docs/field-ranked.png)
 *Ranked field diagram*
 
 #### LRU
 
 The LRU cache maintains the most recently accessed Rows.
 
-![lru field diagram](/img/docs/field-lru.svg)
+![lru field diagram](/img/docs/field-lru.png)
 *LRU field diagram*
 
 ### Time Quantum
@@ -117,7 +116,7 @@ Query operations run in parallel, and they are evenly distributed across a clust
 
 ### Field Type
 
-Upon creation, fields are configured to be of a certain type. Pilosa supports the following field types: `set`, `int`, `time`, and `mutex`.
+Upon creation, fields are configured to be of a certain type. Pilosa supports the following field types: `set`, `int`, `bool`, `time`, and `mutex`.
 
 #### Set
 
@@ -161,7 +160,7 @@ Set(2, B=1)
 Set(3, B=6)
 ```
 
-![BSI field diagram](/img/docs/field-bsi.svg)
+![BSI field diagram](/img/docs/field-bsi.png)
 *BSI field diagram*
 
 Check out this [blog post](/blog/range-encoded-bitmaps/) for some more details about BSI in Pilosa.
@@ -186,9 +185,13 @@ Set(3, A=8, 2017-05-18T00:00)
 Set(3, A=8, 2017-05-19T00:00)
 ```
 
-![time quantum field diagram](/img/docs/field-time-quantum.svg)
+![time quantum field diagram](/img/docs/field-time-quantum.png)
 *Time quantum fueld diagram*
 
 #### Mutex
 
 Mutex fields are similar to `set` fields, with the distinction of requiring the row value for each column to be mutually exclusive. In other words, each column can only have a single value for the field. If the field value for a column is updated on a `mutex` field, then the previous field value for that column will be cleared. This field type is like a field in an RDBMS table where every record contains a single value for a particular field.
+
+#### Boolean
+
+A boolean field is similar to a `mutex` field tracking only two values: `true` and `false`. Boolean fields do not maintain a sorted cache, nor do they support key values.

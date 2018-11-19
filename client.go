@@ -37,20 +37,23 @@ type InternalClient interface {
 	Nodes(ctx context.Context) ([]*Node, error)
 	Query(ctx context.Context, index string, queryRequest *QueryRequest) (*QueryResponse, error)
 	QueryNode(ctx context.Context, uri *URI, index string, queryRequest *QueryRequest) (*QueryResponse, error)
-	Import(ctx context.Context, index, field string, shard uint64, bits []Bit) error
-	ImportK(ctx context.Context, index, field string, bits []Bit) error
+	Import(ctx context.Context, index, field string, shard uint64, bits []Bit, opts ...ImportOption) error
+	ImportK(ctx context.Context, index, field string, bits []Bit, opts ...ImportOption) error
 	EnsureIndex(ctx context.Context, name string, options IndexOptions) error
 	EnsureField(ctx context.Context, indexName string, fieldName string) error
-	ImportValue(ctx context.Context, index, field string, shard uint64, vals []FieldValue) error
-	ImportValueK(ctx context.Context, index, field string, vals []FieldValue) error
+	EnsureFieldWithOptions(ctx context.Context, index, field string, opt FieldOptions) error
+	ImportValue(ctx context.Context, index, field string, shard uint64, vals []FieldValue, opts ...ImportOption) error
+	ImportValueK(ctx context.Context, index, field string, vals []FieldValue, opts ...ImportOption) error
 	ExportCSV(ctx context.Context, index, field string, shard uint64, w io.Writer) error
 	CreateField(ctx context.Context, index, field string) error
+	CreateFieldWithOptions(ctx context.Context, index, field string, opt FieldOptions) error
 	FragmentBlocks(ctx context.Context, uri *URI, index, field, view string, shard uint64) ([]FragmentBlock, error)
 	BlockData(ctx context.Context, uri *URI, index, field, view string, shard uint64, block int) ([]uint64, []uint64, error)
 	ColumnAttrDiff(ctx context.Context, uri *URI, index string, blks []AttrBlock) (map[uint64]map[string]interface{}, error)
 	RowAttrDiff(ctx context.Context, uri *URI, index, field string, blks []AttrBlock) (map[uint64]map[string]interface{}, error)
 	SendMessage(ctx context.Context, uri *URI, msg []byte) error
 	RetrieveShardFromURI(ctx context.Context, index, field string, shard uint64, uri URI) (io.ReadCloser, error)
+	ImportRoaring(ctx context.Context, uri *URI, index, field string, shard uint64, remote bool, data []byte, opts ...ImportOption) error
 }
 
 //===============
@@ -100,10 +103,13 @@ func (n nopInternalClient) Query(ctx context.Context, index string, queryRequest
 func (n nopInternalClient) QueryNode(ctx context.Context, uri *URI, index string, queryRequest *QueryRequest) (*QueryResponse, error) {
 	return nil, nil
 }
-func (n nopInternalClient) Import(ctx context.Context, index, field string, shard uint64, bits []Bit) error {
+func (n nopInternalClient) Import(ctx context.Context, index, field string, shard uint64, bits []Bit, opts ...ImportOption) error {
 	return nil
 }
-func (n nopInternalClient) ImportK(ctx context.Context, index, field string, bits []Bit) error {
+func (n nopInternalClient) ImportK(ctx context.Context, index, field string, bits []Bit, opts ...ImportOption) error {
+	return nil
+}
+func (n nopInternalClient) ImportRoaring(ctx context.Context, uri *URI, index, field string, shard uint64, remote bool, data []byte, opts ...ImportOption) error {
 	return nil
 }
 func (n nopInternalClient) EnsureIndex(ctx context.Context, name string, options IndexOptions) error {
@@ -112,16 +118,22 @@ func (n nopInternalClient) EnsureIndex(ctx context.Context, name string, options
 func (n nopInternalClient) EnsureField(ctx context.Context, indexName string, fieldName string) error {
 	return nil
 }
-func (n nopInternalClient) ImportValue(ctx context.Context, index, field string, shard uint64, vals []FieldValue) error {
+func (n nopInternalClient) EnsureFieldWithOptions(ctx context.Context, index, field string, opt FieldOptions) error {
 	return nil
 }
-func (n nopInternalClient) ImportValueK(ctx context.Context, index, field string, vals []FieldValue) error {
+func (n nopInternalClient) ImportValue(ctx context.Context, index, field string, shard uint64, vals []FieldValue, opts ...ImportOption) error {
+	return nil
+}
+func (n nopInternalClient) ImportValueK(ctx context.Context, index, field string, vals []FieldValue, opts ...ImportOption) error {
 	return nil
 }
 func (n nopInternalClient) ExportCSV(ctx context.Context, index, field string, shard uint64, w io.Writer) error {
 	return nil
 }
 func (n nopInternalClient) CreateField(ctx context.Context, index, field string) error { return nil }
+func (n nopInternalClient) CreateFieldWithOptions(ctx context.Context, index, field string, opt FieldOptions) error {
+	return nil
+}
 func (n nopInternalClient) FragmentBlocks(ctx context.Context, uri *URI, index, field, view string, shard uint64) ([]FragmentBlock, error) {
 	return nil, nil
 }

@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"io/ioutil"
 	gohttp "net/http"
 	"os"
@@ -40,10 +39,6 @@ type Command struct {
 	*server.Command
 
 	commandOptions []server.CommandOption
-
-	stdin  bytes.Buffer
-	stdout bytes.Buffer
-	stderr bytes.Buffer
 }
 
 func OptAllowedOrigins(origins []string) server.CommandOption {
@@ -60,22 +55,25 @@ func newCommand(opts ...server.CommandOption) *Command {
 		panic(err)
 	}
 
-	// set aggressive close timeout by default to avoid hanging tests. This was
+	// Set aggressive close timeout by default to avoid hanging tests. This was
 	// a problem with PDK tests which used go-pilosa as well. We put it at the
 	// beginning of the option slice so that it can be overridden by user-passed
 	// options.
-	opts = append([]server.CommandOption{server.OptCommandCloseTimeout(time.Millisecond * 2)}, opts...)
-	m := &Command{Command: server.NewCommand(os.Stdin, os.Stdout, os.Stderr, opts...), commandOptions: opts}
+	// Also set TranslateFile MapSize to a smaller number so memory allocation
+	// does not fail on 32-bit systems.
+	opts = append([]server.CommandOption{
+		server.OptCommandCloseTimeout(time.Millisecond * 2),
+	}, opts...)
+	m := &Command{commandOptions: opts}
+	m.Command = server.NewCommand(bytes.NewReader(nil), ioutil.Discard, ioutil.Discard, opts...)
 	m.Config.DataDir = path
 	m.Config.Bind = "http://localhost:0"
 	m.Config.Cluster.Disabled = true
-	m.Command.Stdin = &m.stdin
-	m.Command.Stdout = &m.stdout
-	m.Command.Stderr = &m.stderr
+	m.Config.Translation.MapSize = 100000
 
 	if testing.Verbose() {
-		m.Command.Stdout = io.MultiWriter(os.Stdout, m.Command.Stdout)
-		m.Command.Stderr = io.MultiWriter(os.Stderr, m.Command.Stderr)
+		m.Command.Stdout = os.Stdout
+		m.Command.Stderr = os.Stderr
 	}
 
 	return m
@@ -120,7 +118,7 @@ func (m *Command) Reopen() error {
 
 	// Create new main with the same config.
 	config := m.Command.Config
-	m.Command = server.NewCommand(os.Stdin, os.Stdout, os.Stderr, m.commandOptions...)
+	m.Command = server.NewCommand(bytes.NewReader(nil), ioutil.Discard, ioutil.Discard, m.commandOptions...)
 	m.Command.Config = config
 
 	// Run new program.
@@ -129,40 +127,40 @@ func (m *Command) Reopen() error {
 
 // MustCreateIndex uses this command's API to create an index and fails the test
 // if there is an error.
-func (m *Command) MustCreateIndex(t *testing.T, name string, opts pilosa.IndexOptions) *pilosa.Index {
+func (m *Command) MustCreateIndex(tb testing.TB, name string, opts pilosa.IndexOptions) *pilosa.Index {
 	idx, err := m.API.CreateIndex(context.Background(), name, opts)
 	if err != nil {
-		t.Fatalf("creating index: %v with options: %v, err: %v", name, opts, err)
+		tb.Fatalf("creating index: %v with options: %v, err: %v", name, opts, err)
 	}
 	return idx
 }
 
 // MustCreateField uses this command's API to create the field. The index must
 // already exist - it fails the test if there is an error.
-func (m *Command) MustCreateField(t *testing.T, index, field string, opts ...pilosa.FieldOption) *pilosa.Field {
+func (m *Command) MustCreateField(tb testing.TB, index, field string, opts ...pilosa.FieldOption) *pilosa.Field {
 	f, err := m.API.CreateField(context.Background(), index, field, opts...)
 	if err != nil {
-		t.Fatalf("creating field: %s in index: %s err: %v", field, index, err)
+		tb.Fatalf("creating field: %s in index: %s err: %v", field, index, err)
 	}
 	return f
 }
 
 // MustQuery uses this command's API to execute the given query request, failing
 // if Query returns a non-nil error, otherwise returning the QueryResponse.
-func (m *Command) MustQuery(t *testing.T, req *pilosa.QueryRequest) pilosa.QueryResponse {
+func (m *Command) MustQuery(tb testing.TB, req *pilosa.QueryRequest) pilosa.QueryResponse {
 	resp, err := m.API.Query(context.Background(), req)
 	if err != nil {
-		t.Fatalf("making query: %v, err: %v", req, err)
+		tb.Fatalf("making query: %v, err: %v", req, err)
 	}
 	return resp
 }
 
 // MustRecalculateCaches calls RecalculateCaches on the command's API, and fails
 // if there is an error.
-func (m *Command) MustRecalculateCaches(t *testing.T) {
+func (m *Command) MustRecalculateCaches(tb testing.TB) {
 	err := m.API.RecalculateCaches(context.Background())
 	if err != nil {
-		t.Fatalf("recalcluating caches: %v", err)
+		tb.Fatalf("recalcluating caches: %v", err)
 	}
 }
 
@@ -199,6 +197,79 @@ func (m *Command) RecalculateCaches() error {
 // Cluster represents a Pilosa cluster (multiple Command instances)
 type Cluster []*Command
 
+// Query executes an API.Query through one of the cluster's node's API. It fails
+// the test if there is an error.
+func (c Cluster) Query(t testing.TB, index, query string) pilosa.QueryResponse {
+	if len(c) == 0 {
+		t.Fatal("must have at least one node in cluster to query")
+	}
+
+	return c[0].MustQuery(t, &pilosa.QueryRequest{Index: index, Query: query})
+}
+
+func (c Cluster) ImportBits(t testing.TB, index, field string, rowcols [][2]uint64) {
+	byShard := make(map[uint64][][2]uint64)
+	for _, rowcol := range rowcols {
+		shard := rowcol[1] / pilosa.ShardWidth
+		byShard[shard] = append(byShard[shard], rowcol)
+	}
+
+	for shard, bits := range byShard {
+		rowIDs := make([]uint64, len(bits))
+		colIDs := make([]uint64, len(bits))
+		for i, bit := range bits {
+			rowIDs[i] = bit[0]
+			colIDs[i] = bit[1]
+		}
+		nodes, err := c[0].API.ShardNodes(context.Background(), index, shard)
+		if err != nil {
+			t.Fatalf("getting shard nodes: %v", err)
+		}
+		// TODO won't be necessary to do all nodes once that works hits
+		for _, node := range nodes {
+			for _, com := range c {
+				if com.API.Node().ID != node.ID {
+					continue
+				}
+				err := com.API.Import(context.Background(), &pilosa.ImportRequest{
+					Index:     index,
+					Field:     field,
+					Shard:     shard,
+					RowIDs:    rowIDs,
+					ColumnIDs: colIDs,
+				})
+				if err != nil {
+					t.Fatalf("importing data: %v", err)
+				}
+			}
+		}
+	}
+}
+
+// CreateField creates the index (if necessary) and field specified.
+func (c Cluster) CreateField(t testing.TB, index string, iopts pilosa.IndexOptions, field string, fopts ...pilosa.FieldOption) *pilosa.Field {
+	idx, err := c[0].API.CreateIndex(context.Background(), index, iopts)
+	if err != nil && !strings.Contains(err.Error(), "index already exists") {
+		t.Fatalf("creating index: %v", err)
+	} else if err != nil { // index exists
+		idx, err = c[0].API.Index(context.Background(), index)
+		if err != nil {
+			t.Fatalf("getting index: %v", err)
+		}
+	}
+	if idx.Options() != iopts {
+		t.Logf("existing index options:\n%v\ndon't match given opts:\n%v\n in pilosa/test.Cluster.CreateField", idx.Options(), iopts)
+	}
+
+	f, err := c[0].API.CreateField(context.Background(), index, field, fopts...)
+	// we'll assume the field doesn't exist because checking if the options
+	// match seems painful.
+	if err != nil {
+		t.Fatalf("creating field: %v", err)
+	}
+	return f
+}
+
 // Start runs a Cluster
 func (c Cluster) Start() error {
 	var gossipSeeds = make([]string, len(c))
@@ -224,10 +295,10 @@ func (c Cluster) Close() error {
 }
 
 // MustNewCluster creates a new cluster
-func MustNewCluster(t *testing.T, size int, opts ...[]server.CommandOption) Cluster {
+func MustNewCluster(tb testing.TB, size int, opts ...[]server.CommandOption) Cluster {
 	c, err := newCluster(size, opts...)
 	if err != nil {
-		t.Fatalf("new cluster: %v", err)
+		tb.Fatalf("new cluster: %v", err)
 	}
 	return c
 }
@@ -271,10 +342,10 @@ func runCluster(size int, opts ...[]server.CommandOption) (Cluster, error) {
 }
 
 // MustRunCluster creates and starts a new cluster
-func MustRunCluster(t *testing.T, size int, opts ...[]server.CommandOption) Cluster {
+func MustRunCluster(tb testing.TB, size int, opts ...[]server.CommandOption) Cluster {
 	c, err := runCluster(size, opts...)
 	if err != nil {
-		t.Fatalf("run cluster: %v", err)
+		tb.Fatalf("run cluster: %v", err)
 	}
 	return c
 }

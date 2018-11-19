@@ -28,7 +28,9 @@ import (
 
 	"github.com/pilosa/pilosa/pql"
 	"github.com/pilosa/pilosa/roaring"
+	"github.com/pilosa/pilosa/stats"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 // API provides the top level programmatic interface to Pilosa. It is usually
@@ -101,78 +103,22 @@ func (api *API) Query(ctx context.Context, req *QueryRequest) (QueryResponse, er
 		return QueryResponse{}, errors.Wrap(err, "validating api method")
 	}
 
-	resp := QueryResponse{}
-
 	q, err := pql.NewParser(strings.NewReader(req.Query)).Parse()
 	if err != nil {
-		return resp, errors.Wrap(err, "parsing")
+		return QueryResponse{}, errors.Wrap(err, "parsing")
 	}
 	execOpts := &execOptions{
 		Remote:          req.Remote,
-		ExcludeRowAttrs: req.ExcludeRowAttrs,
-		ExcludeColumns:  req.ExcludeColumns,
+		ExcludeRowAttrs: req.ExcludeRowAttrs, // NOTE: Kept for Pilosa 1.x compat.
+		ExcludeColumns:  req.ExcludeColumns,  // NOTE: Kept for Pilosa 1.x compat.
+		ColumnAttrs:     req.ColumnAttrs,     // NOTE: Kept for Pilosa 1.x compat.
 	}
-	results, err := api.server.executor.Execute(ctx, req.Index, q, req.Shards, execOpts)
+	resp, err := api.server.executor.Execute(ctx, req.Index, q, req.Shards, execOpts)
 	if err != nil {
-		return resp, errors.Wrap(err, "executing")
+		return QueryResponse{}, errors.Wrap(err, "executing")
 	}
-	resp.Results = results
 
-	// Fill column attributes if requested.
-	if req.ColumnAttrs && !req.ExcludeColumns {
-		// Consolidate all column ids across all calls.
-		var columnIDs []uint64
-		for _, result := range results {
-			bm, ok := result.(*Row)
-			if !ok {
-				continue
-			}
-			columnIDs = uint64Slice(columnIDs).merge(bm.Columns())
-		}
-
-		// Retrieve column attributes across all calls.
-		columnAttrSets, err := api.readColumnAttrSets(api.holder.Index(req.Index), columnIDs)
-		if err != nil {
-			return resp, errors.Wrap(err, "reading column attrs")
-		}
-
-		// Translate column attributes, if necessary.
-		if api.holder.translateFile != nil {
-			for _, col := range resp.ColumnAttrSets {
-				v, err := api.holder.translateFile.TranslateColumnToString(req.Index, col.ID)
-				if err != nil {
-					return resp, err
-				}
-				col.Key, col.ID = v, 0
-			}
-		}
-
-		resp.ColumnAttrSets = columnAttrSets
-	}
 	return resp, nil
-}
-
-// readColumnAttrSets returns a list of column attribute objects by id.
-func (api *API) readColumnAttrSets(index *Index, ids []uint64) ([]*ColumnAttrSet, error) {
-	if index == nil {
-		return nil, nil
-	}
-
-	ax := make([]*ColumnAttrSet, 0, len(ids))
-	for _, id := range ids {
-		// Read attributes for column. Skip column if empty.
-		attrs, err := index.ColumnAttrStore().Attrs(id)
-		if err != nil {
-			return nil, errors.Wrap(err, "getting attrs")
-		} else if len(attrs) == 0 {
-			continue
-		}
-
-		// Append column with attributes.
-		ax = append(ax, &ColumnAttrSet{ID: id, Attrs: attrs})
-	}
-
-	return ax, nil
 }
 
 // CreateIndex makes a new Pilosa index.
@@ -294,6 +240,83 @@ func (api *API) Field(_ context.Context, indexName, fieldName string) (*Field, e
 	return field, nil
 }
 
+func setUpImportOptions(opts ...ImportOption) (*ImportOptions, error) {
+	options := &ImportOptions{}
+	for _, opt := range opts {
+		err := opt(options)
+		if err != nil {
+			return nil, errors.Wrap(err, "applying option")
+		}
+	}
+	return options, nil
+}
+
+// ImportRoaring is a low level interface for importing data to Pilosa when
+// extremely high throughput is desired. The data must be encoded in a
+// particular way which may be unintuitive (discussed below). The data is merged
+// with existing data.
+//
+// It takes as input a roaring bitmap which it uses as the data for the
+// indicated index, field, and shard. The bitmap may be encoded according to the
+// official roaring spec (https://github.com/RoaringBitmap/RoaringFormatSpec),
+// or to the pilosa roaring spec which supports 64 bit integers
+// (https://www.pilosa.com/docs/latest/architecture/#roaring-bitmap-storage-format).
+//
+// The data should be encoded the same way that Pilosa stores fragments
+// internally. A bit "i" being set in the input bitmap indicates that the bit is
+// set in Pilosa row "i/ShardWidth", and in column
+// (shard*ShardWidth)+(i%ShardWidth). That is to say that "data" represents all
+// of the rows in this shard of this field concatenated together in one long
+// bitmap.
+func (api *API) ImportRoaring(ctx context.Context, indexName, fieldName string, shard uint64, remote bool, data []byte, opts ...ImportOption) (err error) {
+	if len(data) == 0 {
+		return errors.New("no data to import")
+	}
+
+	if err = api.validate(apiField); err != nil {
+		return errors.Wrap(err, "validating api method")
+	}
+
+	// Set up import options.
+	options, err := setUpImportOptions(opts...)
+	if err != nil {
+		return errors.Wrap(err, "setting up import options")
+	}
+
+	nodes := api.cluster.shardNodes(indexName, shard)
+	var eg errgroup.Group
+
+	field := api.holder.Field(indexName, fieldName)
+	if field == nil {
+		return newNotFoundError(ErrFieldNotFound)
+	}
+
+	// only set fields are supported
+	if field.Type() != FieldTypeSet {
+		return NewBadRequestError(errors.New("roaring import is only supported for set fields"))
+	}
+
+	for _, node := range nodes {
+		node := node
+		if node.ID == api.server.nodeID {
+			// must make a copy of data to operate on locally. field.importRoaring changes data
+			d2 := make([]byte, len(data))
+			copy(d2, data)
+			eg.Go(func() error {
+				return field.importRoaring(d2, shard, options.Clear)
+			})
+			go func(node *Node) {
+			}(node)
+		} else if !remote { // if remote == true we don't forward to other nodes
+			// forward it on
+			eg.Go(func() error {
+				return api.server.defaultClient.ImportRoaring(ctx, &node.URI, indexName, fieldName, shard, true, data, opts...)
+			})
+		}
+	}
+	return eg.Wait()
+}
+
 // DeleteField removes the named field from the named index. If the index is not
 // found, an error is returned. If the field is not found, it is ignored and no
 // action is taken.
@@ -324,6 +347,38 @@ func (api *API) DeleteField(_ context.Context, indexName string, fieldName strin
 		return errors.Wrap(err, "sending DeleteField message")
 	}
 	api.holder.Stats.CountWithCustomTags("deleteField", 1, 1.0, []string{fmt.Sprintf("index:%s", indexName)})
+	return nil
+}
+
+// DeleteAvailableShard a shard ID from the available shard set cache.
+func (api *API) DeleteAvailableShard(_ context.Context, indexName, fieldName string, shardID uint64) error {
+	if err := api.validate(apiDeleteAvailableShard); err != nil {
+		return errors.Wrap(err, "validating api method")
+	}
+
+	// Find field.
+	field := api.holder.Field(indexName, fieldName)
+	if field == nil {
+		return newNotFoundError(ErrFieldNotFound)
+	}
+
+	// Delete shard from the cache.
+	if err := field.RemoveAvailableShard(shardID); err != nil {
+		return errors.Wrap(err, "deleting available shard")
+	}
+
+	// Send the delete shard message to all nodes.
+	err := api.server.SendSync(
+		&DeleteAvailableShardMessage{
+			Index:   indexName,
+			Field:   fieldName,
+			ShardID: shardID,
+		})
+	if err != nil {
+		api.server.logger.Printf("problem sending DeleteAvailableShard message: %s", err)
+		return errors.Wrap(err, "sending DeleteAvailableShard message")
+	}
+	api.holder.Stats.CountWithCustomTags("deleteAvailableShard", 1, 1.0, []string{fmt.Sprintf("index:%s", indexName), fmt.Sprintf("field:%s", fieldName)})
 	return nil
 }
 
@@ -638,40 +693,106 @@ func (api *API) FieldAttrDiff(_ context.Context, indexName string, fieldName str
 	return attrs, nil
 }
 
+// ImportOptions holds the options for the API.Import method.
+type ImportOptions struct {
+	Clear          bool
+	IgnoreKeyCheck bool
+}
+
+// ImportOption is a functional option type for API.Import.
+type ImportOption func(*ImportOptions) error
+
+func OptImportOptionsClear(c bool) ImportOption {
+	return func(o *ImportOptions) error {
+		o.Clear = c
+		return nil
+	}
+}
+
+func OptImportOptionsIgnoreKeyCheck(b bool) ImportOption {
+	return func(o *ImportOptions) error {
+		o.IgnoreKeyCheck = b
+		return nil
+	}
+}
+
 // Import bulk imports data into a particular index,field,shard.
-func (api *API) Import(_ context.Context, req *ImportRequest) error {
+func (api *API) Import(ctx context.Context, req *ImportRequest, opts ...ImportOption) error {
 	if err := api.validate(apiImport); err != nil {
 		return errors.Wrap(err, "validating api method")
 	}
 
-	index := api.holder.Index(req.Index)
-	if index == nil {
-		return newNotFoundError(ErrIndexNotFound)
-	}
-
-	field, err := api.indexField(req.Index, req.Field, req.Shard)
+	// Set up import options.
+	options, err := setUpImportOptions(opts...)
 	if err != nil {
-		return errors.Wrap(err, "getting field")
+		return errors.Wrap(err, "setting up import options")
 	}
 
-	// Translate row keys.
-	if field.keys() {
-		if len(req.RowIDs) != 0 {
-			return errors.New("row ids cannot be used because field uses string keys")
+	index, field, err := api.indexField(req.Index, req.Field, req.Shard)
+	if err != nil {
+		return errors.Wrap(err, "getting index and field")
+	}
+
+	// Unless explicitly ignoring key validation (meaning keys have been
+	// translated to ids in a previous step at the coordinator node), then
+	// check to see if keys need translation.
+	if !options.IgnoreKeyCheck {
+		// Translate row keys.
+		if field.keys() {
+			if len(req.RowIDs) != 0 {
+				return errors.New("row ids cannot be used because field uses string keys")
+			}
+			if req.RowIDs, err = api.holder.translateFile.TranslateRowsToUint64(index.Name(), field.Name(), req.RowKeys); err != nil {
+				return errors.Wrap(err, "translating rows")
+			}
 		}
-		if req.RowIDs, err = api.holder.translateFile.TranslateRowsToUint64(index.Name(), field.Name(), req.RowKeys); err != nil {
-			return errors.Wrap(err, "translating rows")
+
+		// Translate column keys.
+		if index.Keys() {
+			if len(req.ColumnIDs) != 0 {
+				return errors.New("column ids cannot be used because index uses string keys")
+			}
+			if req.ColumnIDs, err = api.holder.translateFile.TranslateColumnsToUint64(index.Name(), req.ColumnKeys); err != nil {
+				return errors.Wrap(err, "translating columns")
+			}
+		}
+
+		// For translated data, map the columnIDs to shards. If
+		// this node does not own the shard, forward to the node that does.
+		if index.Keys() || field.keys() {
+			m := make(map[uint64][]Bit)
+
+			for i, colID := range req.ColumnIDs {
+				shard := colID / ShardWidth
+				if _, ok := m[shard]; !ok {
+					m[shard] = make([]Bit, 0)
+				}
+				m[shard] = append(m[shard], Bit{
+					RowID:     req.RowIDs[i],
+					ColumnID:  colID,
+					Timestamp: req.Timestamps[i],
+				})
+			}
+
+			// Signal to the receiving nodes to ignore checking for key translation.
+			opts = append(opts, OptImportOptionsIgnoreKeyCheck(true))
+
+			var eg errgroup.Group
+			for shard, bits := range m {
+				// TODO: if local node owns this shard we don't need to go through the client
+				shard := shard
+				bits := bits
+				eg.Go(func() error {
+					return api.server.defaultClient.Import(ctx, req.Index, req.Field, shard, bits, opts...)
+				})
+			}
+			return eg.Wait()
 		}
 	}
 
-	// Translate column keys.
-	if index.Keys() {
-		if len(req.ColumnIDs) != 0 {
-			return errors.New("column ids cannot be used because index uses string keys")
-		}
-		if req.ColumnIDs, err = api.holder.translateFile.TranslateColumnsToUint64(index.Name(), req.ColumnKeys); err != nil {
-			return errors.Wrap(err, "translating columns")
-		}
+	// Validate shard ownership.
+	if err := api.validateShardOwnership(req.Index, req.Shard); err != nil {
+		return errors.Wrap(err, "validating shard ownership")
 	}
 
 	// Convert timestamps to time.Time.
@@ -680,12 +801,20 @@ func (api *API) Import(_ context.Context, req *ImportRequest) error {
 		if ts == 0 {
 			continue
 		}
-		t := time.Unix(0, ts)
+		t := time.Unix(0, ts).UTC()
 		timestamps[i] = &t
 	}
 
+	// Import columnIDs into existence field.
+	if !options.Clear {
+		if err := importExistenceColumns(index, req.ColumnIDs); err != nil {
+			api.server.logger.Printf("import existence error: index=%s, field=%s, shard=%d, columns=%d, err=%s", req.Index, req.Field, req.Shard, len(req.ColumnIDs), err)
+			return errors.Wrap(err, "importing existence columns")
+		}
+	}
+
 	// Import into fragment.
-	err = field.Import(req.RowIDs, req.ColumnIDs, timestamps)
+	err = field.Import(req.RowIDs, req.ColumnIDs, timestamps, opts...)
 	if err != nil {
 		api.server.logger.Printf("import error: index=%s, field=%s, shard=%d, columns=%d, err=%s", req.Index, req.Field, req.Shard, len(req.ColumnIDs), err)
 	}
@@ -693,40 +822,100 @@ func (api *API) Import(_ context.Context, req *ImportRequest) error {
 }
 
 // ImportValue bulk imports values into a particular field.
-func (api *API) ImportValue(_ context.Context, req *ImportValueRequest) error {
+func (api *API) ImportValue(ctx context.Context, req *ImportValueRequest, opts ...ImportOption) error {
 	if err := api.validate(apiImportValue); err != nil {
 		return errors.Wrap(err, "validating api method")
 	}
 
-	index := api.holder.Index(req.Index)
-	if index == nil {
-		return newNotFoundError(ErrIndexNotFound)
-	}
-
-	field, err := api.indexField(req.Index, req.Field, req.Shard)
+	// Set up import options.
+	options, err := setUpImportOptions(opts...)
 	if err != nil {
-		return errors.Wrap(err, "getting field")
+		return errors.Wrap(err, "setting up import options")
 	}
 
-	// Translate column keys.
-	if index.Keys() {
-		if len(req.ColumnIDs) != 0 {
-			return errors.New("column ids cannot be used because index uses string keys")
+	index, field, err := api.indexField(req.Index, req.Field, req.Shard)
+	if err != nil {
+		return errors.Wrap(err, "getting index and field")
+	}
+
+	// Unless explicitly ignoring key validation (meaning keys have been
+	// translate to ids in a previous step at the coordinator node), then
+	// check to see if keys need translation.
+	if !options.IgnoreKeyCheck {
+		// Translate column keys.
+		if index.Keys() {
+			if len(req.ColumnIDs) != 0 {
+				return errors.New("column ids cannot be used because index uses string keys")
+			}
+			if req.ColumnIDs, err = api.holder.translateFile.TranslateColumnsToUint64(index.Name(), req.ColumnKeys); err != nil {
+				return errors.Wrap(err, "translating columns")
+			}
+
+			// For translated data, map the columnIDs to shards. If
+			// this node does not own the shard, forward to the node that does.
+			m := make(map[uint64][]FieldValue)
+
+			for i, colID := range req.ColumnIDs {
+				shard := colID / ShardWidth
+				if _, ok := m[shard]; !ok {
+					m[shard] = make([]FieldValue, 0)
+				}
+				m[shard] = append(m[shard], FieldValue{
+					Value:    req.Values[i],
+					ColumnID: colID,
+				})
+			}
+
+			// Signal to the receiving nodes to ignore checking for key translation.
+			opts = append(opts, OptImportOptionsIgnoreKeyCheck(true))
+
+			var eg errgroup.Group
+			for shard, vals := range m {
+				// TODO: if local node owns this shard we don't need to go through the client
+				shard := shard
+				vals := vals
+				eg.Go(func() error {
+					return api.server.defaultClient.ImportValue(ctx, req.Index, req.Field, shard, vals, opts...)
+				})
+			}
+			return eg.Wait()
 		}
-		if req.ColumnIDs, err = api.holder.translateFile.TranslateColumnsToUint64(index.Name(), req.ColumnKeys); err != nil {
-			return errors.Wrap(err, "translating columns")
+	}
+
+	// Validate shard ownership.
+	if err := api.validateShardOwnership(req.Index, req.Shard); err != nil {
+		return errors.Wrap(err, "validating shard ownership")
+	}
+
+	// Import columnIDs into existence field.
+	if !options.Clear {
+		if err := importExistenceColumns(index, req.ColumnIDs); err != nil {
+			api.server.logger.Printf("import existence error: index=%s, field=%s, shard=%d, columns=%d, err=%s", req.Index, req.Field, req.Shard, len(req.ColumnIDs), err)
+			return errors.Wrap(err, "importing existence columns")
 		}
 	}
 
 	// Import into fragment.
-	err = field.importValue(req.ColumnIDs, req.Values)
+	err = field.importValue(req.ColumnIDs, req.Values, options)
 	if err != nil {
 		api.server.logger.Printf("import error: index=%s, field=%s, shard=%d, columns=%d, err=%s", req.Index, req.Field, req.Shard, len(req.ColumnIDs), err)
 	}
 	return errors.Wrap(err, "importing")
 }
 
+func importExistenceColumns(index *Index, columnIDs []uint64) error {
+	ef := index.existenceField()
+	if ef == nil {
+		return nil
+	}
+
+	existenceRowIDs := make([]uint64, len(columnIDs))
+	return ef.Import(existenceRowIDs, columnIDs, nil)
+}
+
 // MaxShards returns the maximum shard number for each index in a map.
+// TODO (2.0): This method has been deprecated. Instead, use
+// AvailableShardsByIndex.
 func (api *API) MaxShards(_ context.Context) map[string]uint64 {
 	m := make(map[string]uint64)
 	for k, v := range api.holder.availableShardsByIndex() {
@@ -742,7 +931,7 @@ func (api *API) AvailableShardsByIndex(_ context.Context) map[string]*roaring.Bi
 
 // StatsWithTags returns an instance of whatever implementation of StatsClient
 // pilosa is using with the given tags.
-func (api *API) StatsWithTags(tags []string) StatsClient {
+func (api *API) StatsWithTags(tags []string) stats.StatsClient {
 	if api.holder == nil || api.cluster == nil {
 		return nil
 	}
@@ -758,28 +947,32 @@ func (api *API) LongQueryTime() time.Duration {
 	return api.cluster.longQueryTime
 }
 
-func (api *API) indexField(indexName string, fieldName string, shard uint64) (*Field, error) {
+func (api *API) validateShardOwnership(indexName string, shard uint64) error {
 	// Validate that this handler owns the shard.
 	if !api.cluster.ownsShard(api.Node().ID, indexName, shard) {
 		api.server.logger.Printf("node %s does not own shard %d of index %s", api.Node().ID, shard, indexName)
-		return nil, ErrClusterDoesNotOwnShard
+		return ErrClusterDoesNotOwnShard
 	}
+	return nil
+}
+
+func (api *API) indexField(indexName string, fieldName string, shard uint64) (*Index, *Field, error) {
+	api.server.logger.Printf("importing: %v %v %v", indexName, fieldName, shard)
 
 	// Find the Index.
-	api.server.logger.Printf("importing: %v %v %v", indexName, fieldName, shard)
 	index := api.holder.Index(indexName)
 	if index == nil {
 		api.server.logger.Printf("fragment error: index=%s, field=%s, shard=%d, err=%s", indexName, fieldName, shard, ErrIndexNotFound.Error())
-		return nil, newNotFoundError(ErrIndexNotFound)
+		return nil, nil, newNotFoundError(ErrIndexNotFound)
 	}
 
 	// Retrieve field.
 	field := index.Field(fieldName)
 	if field == nil {
 		api.server.logger.Printf("field error: index=%s, field=%s, shard=%d, err=%s", indexName, fieldName, shard, ErrFieldNotFound.Error())
-		return nil, ErrFieldNotFound
+		return nil, nil, ErrFieldNotFound
 	}
-	return field, nil
+	return index, field, nil
 }
 
 // SetCoordinator makes a new Node the cluster coordinator.
@@ -890,6 +1083,7 @@ const (
 	apiCreateField
 	apiCreateIndex
 	apiDeleteField
+	apiDeleteAvailableShard
 	apiDeleteIndex
 	apiDeleteView
 	apiExportCSV
@@ -928,23 +1122,24 @@ var methodsResizing = map[apiMethod]struct{}{
 }
 
 var methodsNormal = map[apiMethod]struct{}{
-	apiCreateField:       {},
-	apiCreateIndex:       {},
-	apiDeleteField:       {},
-	apiDeleteIndex:       {},
-	apiDeleteView:        {},
-	apiExportCSV:         {},
-	apiFragmentBlockData: {},
-	apiFragmentBlocks:    {},
-	apiField:             {},
-	apiFieldAttrDiff:     {},
-	apiImport:            {},
-	apiImportValue:       {},
-	apiIndex:             {},
-	apiIndexAttrDiff:     {},
-	apiQuery:             {},
-	apiRecalculateCaches: {},
-	apiRemoveNode:        {},
-	apiShardNodes:        {},
-	apiViews:             {},
+	apiCreateField:          {},
+	apiCreateIndex:          {},
+	apiDeleteField:          {},
+	apiDeleteAvailableShard: {},
+	apiDeleteIndex:          {},
+	apiDeleteView:           {},
+	apiExportCSV:            {},
+	apiFragmentBlockData:    {},
+	apiFragmentBlocks:       {},
+	apiField:                {},
+	apiFieldAttrDiff:        {},
+	apiImport:               {},
+	apiImportValue:          {},
+	apiIndex:                {},
+	apiIndexAttrDiff:        {},
+	apiQuery:                {},
+	apiRecalculateCaches:    {},
+	apiRemoveNode:           {},
+	apiShardNodes:           {},
+	apiViews:                {},
 }

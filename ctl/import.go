@@ -40,15 +40,17 @@ type ImportCommand struct { // nolint: maligned
 	Index string `json:"index"`
 	Field string `json:"field"`
 
-	// Options for index & field to be created if they don't exist
-	indexOptions pilosa.IndexOptions
+	// Options for the index to be created if it doesn't exist
+	IndexOptions pilosa.IndexOptions
+
+	// Options for the field to be created if it doesn't exist
+	FieldOptions pilosa.FieldOptions
 
 	// CreateSchema ensures the schema exists before import
 	CreateSchema bool
 
-	// REMOVED: Indicates that the payload should be treated as string keys.
-	// TODO: remove this in a future release
-	StringKeys bool `json:"StringKeys"`
+	// Clear clears the import data as opposed to setting it.
+	Clear bool
 
 	// Filenames to import from.
 	Paths []string `json:"paths"`
@@ -80,11 +82,6 @@ func NewImportCommand(stdin io.Reader, stdout, stderr io.Writer) *ImportCommand 
 func (cmd *ImportCommand) Run(ctx context.Context) error {
 	logger := log.New(cmd.Stderr, "", log.LstdFlags)
 
-	// REMOVED: warning that --string-keys flag has been deprecated.
-	if cmd.StringKeys {
-		logger.Printf("REMOVED: The string-keys flag is no longer used.")
-	}
-
 	// Validate arguments.
 	// Index and field are validated early before the files are parsed.
 	if cmd.Index == "" {
@@ -102,6 +99,14 @@ func (cmd *ImportCommand) Run(ctx context.Context) error {
 	cmd.client = client
 
 	if cmd.CreateSchema {
+		// set the correct type for the field
+		if cmd.FieldOptions.TimeQuantum != "" {
+			cmd.FieldOptions.Type = "time"
+		} else if cmd.FieldOptions.Min != 0 || cmd.FieldOptions.Max != 0 {
+			cmd.FieldOptions.Type = "int"
+		} else {
+			cmd.FieldOptions.Type = "set"
+		}
 		err := cmd.ensureSchema(ctx)
 		if err != nil {
 			return errors.Wrap(err, "ensuring schema")
@@ -142,11 +147,11 @@ func (cmd *ImportCommand) Run(ctx context.Context) error {
 }
 
 func (cmd *ImportCommand) ensureSchema(ctx context.Context) error {
-	err := cmd.client.EnsureIndex(ctx, cmd.Index, cmd.indexOptions)
+	err := cmd.client.EnsureIndex(ctx, cmd.Index, cmd.IndexOptions)
 	if err != nil {
 		return fmt.Errorf("Error Creating Index: %s", err)
 	}
-	err = cmd.client.EnsureField(ctx, cmd.Index, cmd.Field)
+	err = cmd.client.EnsureFieldWithOptions(ctx, cmd.Index, cmd.Field, cmd.FieldOptions)
 	if err != nil {
 		return fmt.Errorf("Error Creating Field: %s", err)
 	}
@@ -253,7 +258,7 @@ func (cmd *ImportCommand) importBits(ctx context.Context, useColumnKeys, useRowK
 	// If keys are used, all bits are sent to the primary translate store (i.e. coordinator).
 	if useColumnKeys || useRowKeys {
 		logger.Printf("importing keys: n=%d", len(bits))
-		if err := cmd.client.ImportK(ctx, cmd.Index, cmd.Field, bits); err != nil {
+		if err := cmd.client.ImportK(ctx, cmd.Index, cmd.Field, bits, pilosa.OptImportOptionsClear(cmd.Clear)); err != nil {
 			return errors.Wrap(err, "importing keys")
 		}
 		return nil
@@ -270,7 +275,7 @@ func (cmd *ImportCommand) importBits(ctx context.Context, useColumnKeys, useRowK
 		}
 
 		logger.Printf("importing shard: %d, n=%d", shard, len(chunk))
-		if err := cmd.client.Import(ctx, cmd.Index, cmd.Field, shard, chunk); err != nil {
+		if err := cmd.client.Import(ctx, cmd.Index, cmd.Field, shard, chunk, pilosa.OptImportOptionsClear(cmd.Clear)); err != nil {
 			return errors.Wrap(err, "importing")
 		}
 	}
@@ -375,7 +380,7 @@ func (cmd *ImportCommand) importValues(ctx context.Context, useColumnKeys bool, 
 		}
 
 		logger.Printf("importing shard: %d, n=%d", shard, len(vals))
-		if err := cmd.client.ImportValue(ctx, cmd.Index, cmd.Field, shard, vals); err != nil {
+		if err := cmd.client.ImportValue(ctx, cmd.Index, cmd.Field, shard, vals, pilosa.OptImportOptionsClear(cmd.Clear)); err != nil {
 			return errors.Wrap(err, "importing values")
 		}
 	}

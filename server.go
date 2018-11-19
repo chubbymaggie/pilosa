@@ -27,7 +27,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pilosa/pilosa/logger"
 	"github.com/pilosa/pilosa/roaring"
+	"github.com/pilosa/pilosa/stats"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -58,7 +60,7 @@ type Server struct { // nolint: maligned
 	// External
 	systemInfo SystemInfo
 	gcNotifier GCNotifier
-	logger     Logger
+	logger     logger.Logger
 
 	nodeID              string
 	uri                 URI
@@ -81,7 +83,7 @@ func (s *Server) Holder() *Holder {
 // ServerOption is a functional option type for pilosa.Server
 type ServerOption func(s *Server) error
 
-func OptServerLogger(l Logger) ServerOption {
+func OptServerLogger(l logger.Logger) ServerOption {
 	return func(s *Server) error {
 		s.logger = l
 		return nil
@@ -169,13 +171,14 @@ func OptServerPrimaryTranslateStore(store TranslateStore) ServerOption {
 }
 
 func OptServerPrimaryTranslateStoreFunc(tf func(interface{}) TranslateStore) ServerOption {
+
 	return func(s *Server) error {
 		s.holder.NewPrimaryTranslateStore = tf
 		return nil
 	}
 }
 
-func OptServerStatsClient(sc StatsClient) ServerOption {
+func OptServerStatsClient(sc stats.StatsClient) ServerOption {
 	return func(s *Server) error {
 		s.holder.Stats = sc
 		return nil
@@ -234,6 +237,13 @@ func OptServerClusterHasher(h Hasher) ServerOption {
 	}
 }
 
+func OptServerTranslateFileMapSize(mapSize int) ServerOption {
+	return func(s *Server) error {
+		s.holder.translateFile = NewTranslateFile(OptTranslateFileMapSize(mapSize))
+		return nil
+	}
+}
+
 // NewServer returns a new instance of Server.
 func NewServer(opts ...ServerOption) (*Server, error) {
 	s := &Server{
@@ -250,7 +260,7 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		metricInterval:      0,
 		diagnosticInterval:  0,
 
-		logger: NopLogger,
+		logger: logger.NopLogger,
 	}
 	s.executor = newExecutor(optExecutorInternalQueryClient(s.defaultClient))
 	s.cluster.InternalClient = s.defaultClient
@@ -263,6 +273,7 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 			return nil, errors.Wrap(err, "applying option")
 		}
 	}
+	s.holder.translateFile.logger = s.logger
 
 	path, err := expandDirName(s.dataDir)
 	if err != nil {
@@ -289,6 +300,7 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		ID:            s.nodeID,
 		URI:           s.uri,
 		IsCoordinator: s.cluster.Coordinator == s.nodeID,
+		State:         nodeStateDown,
 	}
 	s.cluster.Node = node
 	if s.clusterDisabled {
@@ -330,20 +342,20 @@ func (s *Server) Open() error {
 
 	// Initialize id-key storage.
 	if err := s.holder.translateFile.Open(); err != nil {
-		return err
+		return errors.Wrap(err, "opening TranslateFile")
 	}
 
 	// Open Cluster management.
 	if err := s.cluster.waitForStarted(); err != nil {
-		return fmt.Errorf("opening Cluster: %v", err)
+		return errors.Wrap(err, "opening Cluster")
 	}
 
 	// Open holder.
 	if err := s.holder.Open(); err != nil {
-		return fmt.Errorf("opening Holder: %v", err)
+		return errors.Wrap(err, "opening Holder")
 	}
 	if err := s.cluster.setNodeState(nodeStateReady); err != nil {
-		return fmt.Errorf("setting nodeState: %v", err)
+		return errors.Wrap(err, "setting nodeState")
 	}
 
 	// Listen for joining nodes.
@@ -474,7 +486,9 @@ func (s *Server) receiveMessage(m Message) error {
 		if f == nil {
 			return fmt.Errorf("Local field not found: %s/%s", obj.Index, obj.Field)
 		}
-		f.addRemoteAvailableShards(roaring.NewBitmap(obj.Shard))
+		if err := f.AddRemoteAvailableShards(roaring.NewBitmap(obj.Shard)); err != nil {
+			return errors.Wrap(err, "adding remote available shards")
+		}
 	case *CreateIndexMessage:
 		opt := obj.Meta
 		_, err := s.holder.CreateIndex(obj.Index, *opt)
@@ -498,6 +512,11 @@ func (s *Server) receiveMessage(m Message) error {
 	case *DeleteFieldMessage:
 		idx := s.holder.Index(obj.Index)
 		if err := idx.DeleteField(obj.Field); err != nil {
+			return err
+		}
+	case *DeleteAvailableShardMessage:
+		f := s.holder.Field(obj.Index, obj.Field)
+		if err := f.RemoveAvailableShard(obj.ShardID); err != nil {
 			return err
 		}
 	case *CreateViewMessage:
@@ -545,7 +564,10 @@ func (s *Server) receiveMessage(m Message) error {
 	case *RecalculateCaches:
 		s.holder.recalculateCaches()
 	case *NodeEvent:
-		s.cluster.ReceiveEvent(obj)
+		err := s.cluster.ReceiveEvent(obj)
+		if err != nil {
+			return errors.Wrapf(err, "cluster receiving NodeEvent %v", obj)
+		}
 	case *NodeStatus:
 		s.handleRemoteStatus(obj)
 	}
@@ -633,13 +655,15 @@ func (s *Server) mergeRemoteStatus(ns *NodeStatus) error {
 		for _, fs := range is.Fields {
 			f := s.holder.Field(is.Name, fs.Name)
 
-			// if we don't know about an field locally, log a error because
+			// if we don't know about a field locally, log an error because
 			// fields should be created and synced prior to shard creation
 			if f == nil {
 				s.logger.Printf("Local Field not found: %s/%s", is.Name, fs.Name)
 				continue
 			}
-			f.addRemoteAvailableShards(fs.AvailableShards)
+			if err := f.AddRemoteAvailableShards(fs.AvailableShards); err != nil {
+				return errors.Wrap(err, "adding remote available shards")
+			}
 		}
 	}
 
@@ -664,6 +688,7 @@ func (s *Server) monitorDiagnostics() {
 	s.diagnostics.Set("NumCPU", runtime.NumCPU())
 	s.diagnostics.Set("NodeID", s.nodeID)
 	s.diagnostics.Set("ClusterID", s.cluster.id)
+	s.diagnostics.EnrichWithCPUInfo()
 	s.diagnostics.EnrichWithOSInfo()
 
 	// Flush the diagnostics metrics at startup, then on each tick interval

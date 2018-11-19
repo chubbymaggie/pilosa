@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	gohttp "net/http"
 	"reflect"
@@ -196,7 +197,7 @@ func TestClient_Export(t *testing.T) {
 		{RowID: 2, ColumnID: 203, RowKey: "row2", ColumnKey: "col203"},
 	}
 
-	t.Run("Import unkeyed,unkeyedf", func(t *testing.T) {
+	t.Run("Export unkeyed,unkeyedf", func(t *testing.T) {
 		// Populate data.
 		for _, bit := range data {
 			_, err := c.Query(context.Background(), "unkeyed", &pilosa.QueryRequest{
@@ -230,7 +231,7 @@ func TestClient_Export(t *testing.T) {
 		}
 	})
 
-	t.Run("Import unkeyed,keyedf", func(t *testing.T) {
+	t.Run("Export unkeyed,keyedf", func(t *testing.T) {
 		// Populate data.
 		for _, bit := range data {
 			_, err := c.Query(context.Background(), "unkeyed", &pilosa.QueryRequest{
@@ -264,7 +265,7 @@ func TestClient_Export(t *testing.T) {
 		}
 	})
 
-	t.Run("Import keyed,unkeyedf", func(t *testing.T) {
+	t.Run("Export keyed,unkeyedf", func(t *testing.T) {
 		// Populate data.
 		for _, bit := range data {
 			_, err := c.Query(context.Background(), "keyed", &pilosa.QueryRequest{
@@ -298,7 +299,7 @@ func TestClient_Export(t *testing.T) {
 		}
 	})
 
-	t.Run("Import keyed,keyedf", func(t *testing.T) {
+	t.Run("Export keyed,keyedf", func(t *testing.T) {
 		// Populate data.
 		for _, bit := range data {
 			_, err := c.Query(context.Background(), "keyed", &pilosa.QueryRequest{
@@ -360,6 +361,140 @@ func TestClient_Import(t *testing.T) {
 	}
 	if a := hldr.Row("i", "f", 200).Columns(); !reflect.DeepEqual(a, []uint64{6}) {
 		t.Fatalf("unexpected columns: %+v", a)
+	}
+
+	// Clear some data.
+	if err := c.Import(context.Background(), "i", "f", 0, []pilosa.Bit{
+		{RowID: 0, ColumnID: 5},
+		{RowID: 200, ColumnID: 6},
+	}, pilosa.OptImportOptionsClear(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify data.
+	if a := hldr.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1}) {
+		t.Fatalf("unexpected columns: %+v", a)
+	}
+	if a := hldr.Row("i", "f", 200).Columns(); !reflect.DeepEqual(a, []uint64{}) {
+		t.Fatalf("unexpected columns: %+v", a)
+	}
+}
+
+// Ensure client can bulk import data.
+func TestClient_ImportRoaring(t *testing.T) {
+	cluster := test.MustNewCluster(t, 2)
+	for _, c := range cluster {
+		c.Config.Cluster.ReplicaN = 2
+	}
+	err := cluster.Start()
+	if err != nil {
+		t.Fatalf("starting cluster: %v", err)
+	}
+	defer cluster.Close()
+
+	_, err = cluster[0].API.CreateIndex(context.Background(), "i", pilosa.IndexOptions{})
+	if err != nil {
+		t.Fatalf("creating index: %v", err)
+	}
+	_, err = cluster[0].API.CreateField(context.Background(), "i", "f", pilosa.OptFieldTypeSet(pilosa.CacheTypeRanked, 100))
+	if err != nil {
+		t.Fatalf("creating field: %v", err)
+	}
+	_, err = cluster[0].API.Query(context.Background(), &pilosa.QueryRequest{Index: "i", Query: "Set(0, f=1)"})
+	if err != nil {
+		t.Fatalf("querying: %v", err)
+	}
+
+	// Send import request.
+	host := cluster[0].URL()
+	c := MustNewClient(host, http.GetHTTPClient(nil))
+	roaringData, _ := hex.DecodeString("3B3001000100000900010000000100010009000100") // [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65537]
+	if err := c.ImportRoaring(context.Background(), &cluster[0].API.Node().URI, "i", "f", 0, false, roaringData); err != nil {
+		t.Fatal(err)
+	}
+
+	hldr := test.Holder{Holder: cluster[0].Server.Holder()}
+	// Verify data on node 0.
+	if a := hldr.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65537}) {
+		t.Fatalf("unexpected columns: %+v", a)
+	}
+	if a := hldr.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected columns: %+v", a)
+	}
+
+	hldr2 := test.Holder{Holder: cluster[1].Server.Holder()}
+	// Verify data on node 1.
+	if a := hldr2.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65537}) {
+		t.Fatalf("unexpected columns: %+v", a)
+	}
+	if a := hldr2.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected columns: %+v", a)
+	}
+
+	// Ensure that sending a roaring import with the clear flag works as expected.
+	roaringDataClear, _ := hex.DecodeString("3A30000001000000010001001000000003000400") // [65539, 65540]
+	if err := c.ImportRoaring(context.Background(), &cluster[0].API.Node().URI, "i", "f", 0, false, roaringDataClear, pilosa.OptImportOptionsClear(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify data on node 0.
+	if a := hldr.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65537}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+	if a := hldr.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+
+	// Verify data on node 1.
+	if a := hldr2.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65537}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+	if a := hldr2.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+
+	// Ensure that sending a roaring import with the clear flag works as expected.
+	roaringDataClear, _ = hex.DecodeString("3A300000020000000000010001000100180000001C0000000400060001000300") // [4, 6, 65537, 65539]
+	if err := c.ImportRoaring(context.Background(), &cluster[0].API.Node().URI, "i", "f", 0, false, roaringDataClear, pilosa.OptImportOptionsClear(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify data on node 0.
+	if a := hldr.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3, 5, 7, 8, 9, 10}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+	if a := hldr.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+
+	// Verify data on node 1.
+	if a := hldr2.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3, 5, 7, 8, 9, 10}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+	if a := hldr2.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+
+	// Ensure that sending a roaring import with the clear flag works as expected.
+	roaringDataClear, _ = hex.DecodeString("3B3001000100000900010000000100010009000100") // [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65537]
+	if err := c.ImportRoaring(context.Background(), &cluster[0].API.Node().URI, "i", "f", 0, false, roaringDataClear, pilosa.OptImportOptionsClear(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify data on node 0.
+	if a := hldr.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+	if a := hldr.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+
+	// Verify data on node 1.
+	if a := hldr2.Row("i", "f", 0).Columns(); !reflect.DeepEqual(a, []uint64{}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
+	}
+	if a := hldr2.Row("i", "f", 1).Columns(); !reflect.DeepEqual(a, []uint64{0}) {
+		t.Fatalf("unexpected clear columns: %+v", a)
 	}
 }
 
@@ -571,7 +706,7 @@ func TestClient_ImportKeys(t *testing.T) {
 			t.Fatalf("unexpected values: got sum=%v, count=%v; expected sum=50, cnt=3", sum, cnt)
 		}
 
-		// Verify Range
+		// Verify Range.
 		queryRequest := &pilosa.QueryRequest{
 			Query:  fmt.Sprintf(`Range(%s>10)`, fldName),
 			Remote: false,
@@ -583,6 +718,37 @@ func TestClient_ImportKeys(t *testing.T) {
 		}
 
 		if !reflect.DeepEqual(result.Results[0].(*pilosa.Row).Keys, []string{"col2", "col3"}) {
+			t.Fatalf("unexpected column keys: %s", spew.Sdump(result))
+		}
+
+		// Clear data.
+		if err := c.ImportValue(context.Background(), "i", "f", 0, []pilosa.FieldValue{
+			{ColumnKey: "col2", Value: 20},
+		}, pilosa.OptImportOptionsClear(true)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify Sum.
+		sum, cnt, err = field.Sum(nil, fldName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum != 30 || cnt != 2 {
+			t.Fatalf("unexpected values: got sum=%v, count=%v; expected sum=30, cnt=2", sum, cnt)
+		}
+
+		// Verify Range.
+		queryRequest = &pilosa.QueryRequest{
+			Query:  fmt.Sprintf(`Range(%s>10)`, fldName),
+			Remote: false,
+		}
+
+		result, err = c.Query(context.Background(), "i", queryRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !reflect.DeepEqual(result.Results[0].(*pilosa.Row).Keys, []string{"col3"}) {
 			t.Fatalf("unexpected column keys: %s", spew.Sdump(result))
 		}
 	})
@@ -653,6 +819,122 @@ func TestClient_ImportValue(t *testing.T) {
 	if max != 40 || cnt != 1 {
 		t.Fatalf("unexpected values: got max=%v, count=%v; expected max=40, cnt=1", max, cnt)
 	}
+
+	// Send import request.
+	if err := c.ImportValue(context.Background(), "i", "f", 0, []pilosa.FieldValue{
+		{ColumnID: 1, Value: -10},
+		{ColumnID: 3, Value: 40},
+	}, pilosa.OptImportOptionsClear(true)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify Sum.
+	sum, cnt, err = field.Sum(nil, fldName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum != 20 || cnt != 1 {
+		t.Fatalf("unexpected values: got sum=%v, count=%v; expected sum=20, cnt=1", sum, cnt)
+	}
+
+	// Verify Min with Filter.
+	filter, err = field.Range(fldName, pql.GT, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	min, cnt, err = field.Min(filter, fldName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if min != -100 || cnt != 0 {
+		t.Fatalf("unexpected values: got min=%v, count=%v; expected min=-100, cnt=0", min, cnt)
+	}
+
+	// Verify Max.
+	max, cnt, err = field.Max(nil, fldName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if max != 20 || cnt != 1 {
+		t.Fatalf("unexpected values: got max=%v, count=%v; expected max=20, cnt=1", max, cnt)
+	}
+}
+
+// Ensure client can bulk import data while tracking existence.
+func TestClient_ImportExistence(t *testing.T) {
+	cmd := test.MustRunCluster(t, 1)[0]
+	host := cmd.URL()
+	holder := cmd.Server.Holder()
+	hldr := test.Holder{Holder: holder}
+
+	t.Run("Set", func(t *testing.T) {
+		idxName := "iset"
+		fldName := "fset"
+
+		index := hldr.MustCreateIndexIfNotExists(idxName, pilosa.IndexOptions{TrackExistence: true})
+		_, err := index.CreateFieldIfNotExists(fldName)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Send import request.
+		c := MustNewClient(host, http.GetHTTPClient(nil))
+		if err := c.Import(context.Background(), idxName, fldName, 0, []pilosa.Bit{
+			{RowID: 0, ColumnID: 1},
+			{RowID: 0, ColumnID: 5},
+			{RowID: 200, ColumnID: 6},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify data.
+		if a := hldr.Row(idxName, fldName, 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 5}) {
+			t.Fatalf("unexpected columns: %+v", a)
+		}
+		if a := hldr.Row(idxName, fldName, 200).Columns(); !reflect.DeepEqual(a, []uint64{6}) {
+			t.Fatalf("unexpected columns: %+v", a)
+		}
+
+		// Verify existence.
+		if a := hldr.ReadRow(idxName, "exists", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 5, 6}) {
+			t.Fatalf("unexpected existence columns: %+v", a)
+		}
+	})
+
+	t.Run("Int", func(t *testing.T) {
+		idxName := "iint"
+		fldName := "fint"
+
+		index := hldr.MustCreateIndexIfNotExists(idxName, pilosa.IndexOptions{TrackExistence: true})
+		field, err := index.CreateFieldIfNotExists(fldName, pilosa.OptFieldTypeInt(-100, 100))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Send import request.
+		c := MustNewClient(host, http.GetHTTPClient(nil))
+		if err := c.ImportValue(context.Background(), idxName, fldName, 0, []pilosa.FieldValue{
+			{ColumnID: 1, Value: -10},
+			{ColumnID: 2, Value: 20},
+			{ColumnID: 3, Value: 40},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify Sum.
+		sum, cnt, err := field.Sum(nil, fldName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum != 50 || cnt != 3 {
+			t.Fatalf("unexpected values: got sum=%v, count=%v; expected sum=50, cnt=3", sum, cnt)
+		}
+
+		// Verify existence.
+		if a := hldr.ReadRow(idxName, "exists", 0).Columns(); !reflect.DeepEqual(a, []uint64{1, 2, 3}) {
+			t.Fatalf("unexpected existence columns: %+v", a)
+		}
+	})
 }
 
 // Ensure client can retrieve a list of all checksums for blocks in a fragment.

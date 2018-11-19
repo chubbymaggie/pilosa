@@ -22,8 +22,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pilosa/pilosa/logger"
 	"github.com/pilosa/pilosa/pql"
 	"github.com/pilosa/pilosa/roaring"
+	"github.com/pilosa/pilosa/stats"
 	"github.com/pkg/errors"
 )
 
@@ -50,9 +52,9 @@ type view struct {
 	fragments map[uint64]*fragment
 
 	broadcaster  broadcaster
-	stats        StatsClient
+	stats        stats.StatsClient
 	rowAttrStore AttrStore
-	logger       Logger
+	logger       logger.Logger
 }
 
 // newView returns a new instance of View.
@@ -70,8 +72,8 @@ func newView(path, index, field, name string, fieldOptions FieldOptions) *view {
 		fragments: make(map[uint64]*fragment),
 
 		broadcaster: NopBroadcaster,
-		stats:       NopStatsClient,
-		logger:      NopLogger,
+		stats:       stats.NopStatsClient,
+		logger:      logger.NopLogger,
 	}
 }
 
@@ -228,6 +230,7 @@ func (v *view) createFragmentIfNotExists(shard uint64) (*fragment, error) {
 		Field: v.field,
 		Shard: shard,
 	}); err != nil {
+		frag.close()
 		return nil, errors.Wrap(err, "sending createshard message")
 	}
 
@@ -244,6 +247,8 @@ func (v *view) newFragment(path string, shard uint64) *fragment {
 	frag.stats = v.stats.WithTags(fmt.Sprintf("shard:%d", shard))
 	if v.fieldType == FieldTypeMutex {
 		frag.mutexVector = newRowsVector(frag)
+	} else if v.fieldType == FieldTypeBool {
+		frag.mutexVector = newBoolVector(frag)
 	}
 	return frag
 }

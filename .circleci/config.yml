@@ -44,6 +44,12 @@ jobs:
     <<: *base-test
     environment:
       GOARCH: 386
+  cluster-tests:
+    <<: *defaults
+    steps:
+      - *fast-checkout
+      - setup_remote_docker
+      - run: make clustertests-build
   prerelease:
     <<: *base-test
     steps:
@@ -68,9 +74,20 @@ jobs:
     docker:
       - image: circleci/python:2.7-jessie
     steps:
+      - run: '[[ -v CIRCLE_PR_NUMBER ]] && circleci step halt || true' # Skip job if this is a PR
       - *fast-checkout
       - run: sudo pip install awscli
       - run: make prerelease-upload
+  dockerhub-upload:
+    <<: *defaults
+    steps:
+      - run: '[[ -v CIRCLE_PR_NUMBER ]] && circleci step halt || true' # Skip job if this is a PR
+      - *fast-checkout
+      - setup_remote_docker
+      - run: make docker
+      - run: docker tag pilosa:$(git describe --tags) pilosa/pilosa:master
+      - run: docker login -u $DOCKER_USER -p $DOCKER_PASS
+      - run: docker push pilosa/pilosa:master
 workflows:
   version: 2
   test:
@@ -86,6 +103,9 @@ workflows:
           requires:
             - build
       - test-golang-1.10-386:
+          requires:
+            - build
+      - cluster-tests:
           requires:
             - build
       - prerelease:
@@ -104,3 +124,7 @@ workflows:
       - prerelease-upload:
           requires:
             - prerelease
+      - dockerhub-upload:
+          requires:
+            - linter
+            - test-golang-1.10

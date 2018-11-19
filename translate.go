@@ -5,11 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,6 +15,8 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash"
+	"github.com/pilosa/pilosa/logger"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -69,7 +69,7 @@ type TranslateFile struct {
 
 	Path    string
 	mapSize int
-
+	logger  logger.Logger
 	// If non-nil, data is streamed from a primary and this is a read-only store.
 	PrimaryTranslateStore TranslateStore
 	primaryID             string // unique ID used to identify the primary store
@@ -81,9 +81,35 @@ type TranslateFile struct {
 	replicationRetryInterval time.Duration
 }
 
+// TranslateFileOption is a functional option type for pilosa.TranslateFile
+type TranslateFileOption func(f *TranslateFile) error
+
+func OptTranslateFileMapSize(mapSize int) TranslateFileOption {
+	return func(f *TranslateFile) error {
+		f.mapSize = mapSize
+		return nil
+	}
+}
+func OptTranslateFileLogger(l logger.Logger) TranslateFileOption {
+	return func(s *TranslateFile) error {
+		s.logger = l
+		return nil
+	}
+}
+
 // NewTranslateFile returns a new instance of TranslateFile.
-func NewTranslateFile() *TranslateFile {
-	return &TranslateFile{
+func NewTranslateFile(opts ...TranslateFileOption) *TranslateFile {
+	var defaultMapSize64 int64 = 10 * (1 << 30)
+	var defaultMapSize int
+
+	if ^uint(0)>>32 > 0 {
+		// 10GB default map size
+		defaultMapSize = int(defaultMapSize64)
+	} else {
+		// Use 2GB default map size on 32-bit systems
+		defaultMapSize = (1 << 31) - 1
+	}
+	f := &TranslateFile{
 		writeNotify: make(chan struct{}),
 		closing:     make(chan struct{}),
 		cols:        make(map[string]*index),
@@ -91,30 +117,42 @@ func NewTranslateFile() *TranslateFile {
 
 		mapSize: defaultMapSize,
 
+		logger: logger.NopLogger,
+
 		replicationClosing: make(chan struct{}),
 		primaryStoreEvents: make(chan primaryStoreEvent),
 
 		replicationRetryInterval: defaultReplicationRetryInterval,
 	}
+
+	for _, opt := range opts {
+		err := opt(f)
+		if err != nil {
+			// TODO (2.0): Change func signature to return error
+			panic(errors.Wrap(err, "applying option"))
+		}
+	}
+
+	return f
 }
 
 func (s *TranslateFile) Open() (err error) {
 	// Open writer & buffered writer.
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0777); err != nil {
-		return err
+		return errors.Wrapf(err, "mkdir %s", filepath.Dir(s.Path))
 	} else if s.file, err = os.OpenFile(s.Path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666); err != nil {
-		return err
+		return errors.Wrapf(err, "open file %s", s.Path)
 	}
 	s.w = bufio.NewWriter(s.file)
 
 	// Memory map data file.
 	if s.data, err = syscall.Mmap(int(s.file.Fd()), 0, s.mapSize, syscall.PROT_READ, syscall.MAP_SHARED); err != nil {
-		return err
+		return errors.Wrapf(err, "creating Mmap (size: %d)", s.mapSize)
 	}
 
 	// Replay the log.
 	if err := s.replayEntries(); err != nil {
-		return err
+		return errors.Wrap(err, "replaying log entries")
 	}
 
 	// Listen to primaryStoreEvents channel.
@@ -157,12 +195,12 @@ func (s *TranslateFile) handlePrimaryStoreEvent(ev primaryStoreEvent) error {
 	}
 
 	// Stop translate store replication.
-	log.Printf("stop monitor replication")
+	s.logger.Printf("stop monitor replication")
 	close(s.replicationClosing)
 	s.repWG.Wait()
 
 	// Set the primary node for translate store replication.
-	log.Printf("set primary translate store to %s", ev.id)
+	s.logger.Printf("set primary translate store to %s", ev.id)
 	s.primaryID = ev.id
 	if ev.id == "" {
 		s.PrimaryTranslateStore = nil
@@ -171,7 +209,7 @@ func (s *TranslateFile) handlePrimaryStoreEvent(ev primaryStoreEvent) error {
 	}
 
 	// Start translate store replication. Stream from primary, if available.
-	log.Printf("start monitor replication")
+	s.logger.Printf("start monitor replication")
 	if s.PrimaryTranslateStore != nil {
 		s.replicationClosing = make(chan struct{})
 		s.repWG.Add(1)
@@ -333,14 +371,14 @@ func (s *TranslateFile) monitorReplication() {
 	// Keep attempting to replicate until the store closes.
 	for {
 		if err := s.replicate(ctx); err != nil {
-			log.Printf("pilosa: replication error: %s", err)
+			s.logger.Printf("pilosa: replication error: %s", err)
 		}
 
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(s.replicationRetryInterval):
-			log.Printf("pilosa: reconnecting to primary replica")
+			s.logger.Printf("pilosa: reconnecting to primary replica")
 		}
 	}
 }
@@ -348,7 +386,7 @@ func (s *TranslateFile) monitorReplication() {
 // monitorPrimaryStoreEvents is executed in a separate goroutine and listens for changes
 // to the primary store assignment.
 func (s *TranslateFile) monitorPrimaryStoreEvents() {
-	log.Printf("monitor primary store events")
+	s.logger.Printf("monitor primary store events")
 	// Keep handling events until the store closes.
 	for {
 		select {
@@ -356,7 +394,7 @@ func (s *TranslateFile) monitorPrimaryStoreEvents() {
 			return
 		case ev := <-s.primaryStoreEvents:
 			if err := s.handlePrimaryStoreEvent(ev); err != nil {
-				log.Printf("handle primary store event")
+				s.logger.Printf("handle primary store event")
 			}
 		}
 	}
@@ -366,7 +404,7 @@ func (s *TranslateFile) replicate(ctx context.Context) error {
 	off := s.size()
 
 	// Connect to remote primary.
-	log.Printf("pilosa: replicating from offset %d", off)
+	s.logger.Printf("pilosa: replicating from offset %d", off)
 	rc, err := s.PrimaryTranslateStore.Reader(ctx, off)
 	if err != nil {
 		return err
